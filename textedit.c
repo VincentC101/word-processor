@@ -1,6 +1,9 @@
 /*** includes ****/
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdbool.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -13,6 +16,7 @@
 #define CTRL_KEY(k) ((k) & 0x1f)
 #define TAB_STOP 4
 enum editorKey {
+    BACKSPACE = 127,
     UP_ARROW = 1000,
     DOWN_ARROW,
     LEFT_ARROW,
@@ -40,10 +44,14 @@ struct editorConfig {
     int screen_cols;
     int num_rows;
     erow* row;
+    bool dirty;
     char* filename;
+    char message[100];
     struct termios orig_termios;
 };
 struct editorConfig E;
+
+void editorSetStatusMessage(const char *fmt, ...);
 
 /*** terminal ***/
 
@@ -162,7 +170,7 @@ int getWindowSize(int *rows, int *cols) {
     }
 }
 
-/*** File IN OUT ***/
+/*** row ops */
 int charToRender(erow *row, int cx) {
     int rx = 0;
     int j;
@@ -202,10 +210,12 @@ void editorUpdateRow(erow *row) {
     row->rsize = idx;
 }
 
-void editorAppendRow(char* s, size_t len) {
-    E.row = realloc(E.row, sizeof(erow) * (E.num_rows + 1));
+void editorInsertRow(int at, char* s, size_t len) {
+    if(at < 0 || at > E.num_rows) return;
 
-    int at = E.num_rows;
+    E.row = realloc(E.row, sizeof(erow) * (E.num_rows + 1));
+    memmove(&E.row[at+1], &E.row[at], sizeof(erow) * (E.num_rows - at));
+
     E.row[at].size = len;
     E.row[at].chars = malloc(len + 1);
     memcpy(E.row[at].chars, s, len);
@@ -215,6 +225,66 @@ void editorAppendRow(char* s, size_t len) {
     editorUpdateRow(&E.row[at]);
 
     E.num_rows ++;
+    E.dirty = true;
+}
+
+void editorFreeRow(erow* row) {
+    free(row->render);
+    free(row->chars);
+}
+
+void editorDeleteRow(int at) {
+    if(at < 0 || at >= E.num_rows) return;
+    editorFreeRow(&E.row[at]);
+    memmove(&E.row[at], &E.row[at+1], sizeof(erow) * (E.num_rows - at - 1));
+    E.num_rows--;
+}
+
+void editorRowInsertChar(erow *row, int at, char c) {
+    if (at < 0 || at > row->size) at = row->size;
+    row->chars = realloc(row->chars, row->size + 2);
+    memmove(&row->chars[at+1], &row->chars[at], row->size - at + 1);
+    row->size ++;
+    row->chars[at] = c;
+    editorUpdateRow(row);
+    E.dirty = true;
+}
+
+void editorRowAppendString(erow *row, char *s, size_t len) {
+    row->chars = realloc(row->chars, row->size + len + 1);
+    memcpy(&row->chars[row->size], s, len);
+    row->size += len;
+    row->chars[row->size] = '\0';
+    editorUpdateRow(row);
+}
+
+void editorRowDelChar(erow *row, int at) {
+    if (at < 0 || at > row->size) at = row->size;
+    memmove(&row->chars[at], &row->chars[at+1], row->size - at);
+    row->size--;
+    editorUpdateRow(row);
+    E.dirty = true;
+}
+
+/*** File IN OUT ***/
+char* editorRowsToString(int* bufferlen) {
+    int totlen = 0;
+    int j;
+    for (j=0; j < E.num_rows; j++) {
+        totlen += E.row[j].size + 1;
+    }
+    *bufferlen += totlen;
+    char* text = malloc(totlen);
+    char *p = text;
+
+    for (j=0; j < E.num_rows; j++) {
+        memcpy(p, E.row[j].chars, E.row[j].size);
+        p += E.row[j].size;
+        *p = '\n';
+        p++;
+    }
+
+    return text;
 }
 
 void editorOpen(char* filename) {
@@ -230,10 +300,76 @@ void editorOpen(char* filename) {
         while (linelen > 0 && (line[linelen - 1] == '\n' ||
             line[linelen - 1] == '\r'))
             linelen--;
-        editorAppendRow(line, linelen);
+        editorInsertRow(E.num_rows, line, linelen);
     }
     free(line);
     fclose(fp);
+    E.dirty = false;
+}
+
+void editorSave(void) {
+    if (E.filename == NULL) return;
+
+    int len;
+    char* buffer = editorRowsToString(&len);
+    int fd = open(E.filename, O_RDWR | O_CREAT, 0664);
+    if (fd != -1){
+        if (ftruncate(fd, len) != -1){
+            if (write(fd, buffer, len) == len){
+                close(fd);
+                free(buffer);
+                E.dirty = false;
+                editorSetStatusMessage("%d bytes written to disk", len);
+                return;
+            }
+        }
+        close(fd);
+    }
+    free(buffer);
+    editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
+}
+
+/*** editor ops ***/
+void editorInsertChar(char c) {
+    if(E.cursor_y == E.num_rows) {
+        editorInsertRow(E.num_rows, "", 0);
+    }
+    editorRowInsertChar(&E.row[E.cursor_y], E.cursor_x, c);
+    E.cursor_x++;
+}
+
+void editorDeleteChar(void) {
+    if(E.cursor_y == E.num_rows) {
+        return;
+    }
+    if(E.cursor_x == 0 && E.cursor_y == 0) {
+        return;
+    }
+    erow *row = &E.row[E.cursor_y];
+    if(E.cursor_x > 0){
+        editorRowDelChar(row, E.cursor_x-1);
+        E.cursor_x--;
+    } else {
+        E.cursor_x = E.row[E.cursor_y - 1].size;
+        editorRowAppendString(&E.row[E.cursor_y - 1], row->chars, row->size);
+        editorDeleteRow(E.cursor_y);
+        E.cursor_y--;
+    }
+}
+
+void editorInsertNewline(void) {
+    if(E.cursor_x == 0){
+        editorInsertRow(E.cursor_y, "", 0);
+    } else {
+        erow *row = &E.row[E.cursor_y];
+        editorInsertRow(E.cursor_y + 1, &row->chars[E.cursor_x], row->size - E.cursor_x);
+        row = &E.row[E.cursor_y];
+        row->size = E.cursor_x;
+        row->chars[row->size] = '\0';
+        editorUpdateRow(row);
+    }
+    E.cursor_y++;
+    E.cursor_x = 0;
 }
 
 /*** append buffer ***/
@@ -309,20 +445,30 @@ void drawRows(struct buffer *ab){
 
 void drawStatusBar(struct buffer *ab) {
     appendBuffer(ab, "\x1b[7m", 4);
-    char status[80];
-    int len = snprintf(status, sizeof(status), "%.20s - line %d", E.filename ? E.filename : "[No Name]", E.cursor_y+1);
+    char status[100];
+    int len = snprintf(status, sizeof(status), "%.20s - line %d %s", E.filename ? E.filename : "[No Name]", 
+    E.cursor_y+1, E.dirty ? "(modified)" : "");
     if (len > E.screen_cols) len = E.screen_cols;
     appendBuffer(ab, status, len);
+    while (len < E.screen_cols){
+        appendBuffer(ab, " ", 1);
+        len++;
+    }
     appendBuffer(ab, "\x1b[m", 3);
     appendBuffer(ab, "\r\n", 2);
 }
 
 void drawMessageBar(struct buffer *ab) {
+    appendBuffer(ab, "\x1b[K", 3);
     appendBuffer(ab, "\x1b[7m", 4);
-    char status[80];
-    int len = snprintf(status, sizeof(status), "CTRL-Q: Quit - CTRL-1: Show Help Menu - CTRL-0: Hide Help Menu");
+    char* status = E.message;
+    int len = strlen(E.message);
     if (len > E.screen_cols) len = E.screen_cols;
     appendBuffer(ab, status, len);
+    while (len < E.screen_cols){
+        appendBuffer(ab, " ", 1);
+        len++;
+    }
     appendBuffer(ab, "\x1b[m", 3);
 }
 
@@ -347,6 +493,12 @@ void clearScreen(void) {
     freeBuffer(&ab);
 }
 
+void editorSetStatusMessage(const char* fmt, ...){
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(E.message, sizeof(E.message), fmt, ap);
+    va_end(ap);
+}
 /*** input ***/
 
 void moveCursor(int key) {
@@ -388,10 +540,32 @@ void moveCursor(int key) {
 }
 
 void processKey(void) {
+    static int quit_times = 1;
     int c = readKey();
 
     switch (c) {
+        case '\r':
+            editorInsertNewline();
+            break;
+
+        case BACKSPACE:
+        case CTRL_KEY('h'):
+        case DEL_KEY:
+            if (c == DEL_KEY) moveCursor(RIGHT_ARROW);
+            editorDeleteChar();
+            break;
+
+        case CTRL_KEY('s'):
+            editorSave();
+            break;
+
         case CTRL_KEY('q'):
+            if (E.dirty && quit_times > 0){
+                editorSetStatusMessage("You have unsaved changes, are you sure you want to quit?? "
+                "Press CTRL-Q again to quit.");
+                quit_times--;
+                return;
+            }
             write(STDOUT_FILENO, "\x1b[2J", 4);
             write(STDOUT_FILENO, "\x1b[H", 3);
             exit(0);
@@ -426,7 +600,16 @@ void processKey(void) {
         case RIGHT_ARROW:
             moveCursor(c);
             break;
+
+        case CTRL_KEY('l'):
+        case '\x1b':
+            break;
+
+        default:
+            editorInsertChar(c);
+            break;
     }
+    quit_times = 2;
 }
 
 /*** init ***/
@@ -443,6 +626,8 @@ void initializeEditor(void){
     E.num_rows = 0;
     E.row = NULL;
     E.filename = NULL;
+    E.dirty = false;
+    E.message[0] = '\0';
 }
 
 int main(int argc, char* argv[]){
@@ -451,6 +636,7 @@ int main(int argc, char* argv[]){
     if (argc >= 2) {
     editorOpen(argv[1]);
     }
+    editorSetStatusMessage("CTRL-1: Show Help Menu | Ctrl-S = save | Ctrl-Q = quit");
 
     while(1) {
         clearScreen();
