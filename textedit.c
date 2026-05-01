@@ -51,7 +51,11 @@ struct editorConfig {
 };
 struct editorConfig E;
 
+//functions we need to call early
+
 void editorSetStatusMessage(const char *fmt, ...);
+void refreshScreen(void);
+char *prompt(char *prompt);
 
 /*** terminal ***/
 
@@ -100,8 +104,8 @@ int readKey(void) {
 
     if(c == '\x1b') {
         char seq[3];
-        if(read(STDIN_FILENO, &seq[0], 1) != 1) return -1;
-        if(read(STDIN_FILENO, &seq[1], 1) != 1) return -1;
+        if(read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
+        if(read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
 
         if(seq[0] == '[') {
             if(seq[1] >= '0' && seq[1] <= '9'){
@@ -273,7 +277,7 @@ char* editorRowsToString(int* bufferlen) {
     for (j=0; j < E.num_rows; j++) {
         totlen += E.row[j].size + 1;
     }
-    *bufferlen += totlen;
+    *bufferlen = totlen;
     char* text = malloc(totlen);
     char *p = text;
 
@@ -308,7 +312,13 @@ void editorOpen(char* filename) {
 }
 
 void editorSave(void) {
-    if (E.filename == NULL) return;
+    if (E.filename == NULL) {
+        E.filename = prompt("Save as: %s (press ESC to cancel)");
+        if(E.filename == NULL){
+            editorSetStatusMessage("Save Aborted");
+            return;
+        }
+    } 
 
     int len;
     char* buffer = editorRowsToString(&len);
@@ -434,7 +444,17 @@ void drawRows(struct buffer *ab){
             int len = E.row[filerow].rsize - E.coloffset;
             if(len < 0) len = 0;
             if (len > E.screen_cols) len = E.screen_cols;
-            appendBuffer(ab, &E.row[filerow].render[E.coloffset], len);
+            for (int j = 0; j < len; j++) {//bullshit handler
+                char c = E.row[filerow].render[E.coloffset + j];
+                if (iscntrl(c)) {
+                    char sym = (c <= 26) ? '@' + c : '?';
+                    appendBuffer(ab, "\x1b[7m", 4); // invert colors
+                    appendBuffer(ab, &sym, 1);
+                    appendBuffer(ab, "\x1b[m", 3);  // reset
+                } else {
+                    appendBuffer(ab, &c, 1);
+                }
+            }//bullshit handler end
         }
         
         appendBuffer(ab, "\x1b[K", 3);
@@ -472,7 +492,7 @@ void drawMessageBar(struct buffer *ab) {
     appendBuffer(ab, "\x1b[m", 3);
 }
 
-void clearScreen(void) {
+void refreshScreen(void) {
     editorScroll();
     struct buffer ab = ABUF_INIT;
 
@@ -500,6 +520,39 @@ void editorSetStatusMessage(const char* fmt, ...){
     va_end(ap);
 }
 /*** input ***/
+char* prompt(char *prompt){
+    size_t buffer_size = 128;
+    char* buffer = malloc(buffer_size);
+    buffer[0] = '\0';
+    size_t len = 0;
+
+    while(1) {
+        editorSetStatusMessage(prompt, buffer);
+        refreshScreen();
+
+        int c = readKey();
+        if (c == DEL_KEY || c == CTRL_KEY('h') || c == BACKSPACE) {
+            if (len != 0) buffer[--len] = '\0';
+        } else if (c == '\x1b') {
+            editorSetStatusMessage("");
+            free(buffer);
+            return NULL;
+        } else if(c == '\r') {
+            if(len != 0) {
+                editorSetStatusMessage("");
+                return buffer;
+            }
+        } else if(!iscntrl(c) && c < 128) {
+            if(len == buffer_size - 1) {
+                buffer_size *= 2;
+                buffer = realloc(buffer, buffer_size);
+            }
+            buffer[len++] = c;
+            buffer[len] = '\0';
+        }
+    }
+    
+}
 
 void moveCursor(int key) {
     erow *row = (E.cursor_y >= E.num_rows) ? NULL : &E.row[E.cursor_y];
@@ -639,7 +692,7 @@ int main(int argc, char* argv[]){
     editorSetStatusMessage("CTRL-1: Show Help Menu | Ctrl-S = save | Ctrl-Q = quit");
 
     while(1) {
-        clearScreen();
+        refreshScreen();
         processKey();
     }
 
